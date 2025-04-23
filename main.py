@@ -1,5 +1,4 @@
 # eda_analyzer.py
-
 import polars as pl # Changed import
 import polars.selectors as cs # Import selectors for easier dtype selection
 import matplotlib.pyplot as plt
@@ -21,7 +20,7 @@ except ImportError:
 DEFAULT_DATA_FILEPATH = "training_set_VU_DM.csv"
 DEFAULT_PLOT_DIR = "eda_plots"
 
-class MyModel: # Renamed class for clarity
+class DataExplorationClass: # Renamed class for clarity
     def __init__(self):
         self.dataframe: Optional[pl.DataFrame] = None # Use a more descriptive name, hint with Polars DataFrame
 
@@ -481,3 +480,10 @@ class MyModel: # Renamed class for clarity
             finally:
                  plt_obj.close() # Close after showing in non-saving mode
  
+
+
+class ModelClass:
+    pass
+
+class ModelTestingClass:
+    pass
