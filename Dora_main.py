@@ -1,4 +1,4 @@
-from EDA import MyModel
+from Dora_EDA import MyModel
 
 model = MyModel()
 model.load_data(filepath="training_set_VU_DM.csv")
