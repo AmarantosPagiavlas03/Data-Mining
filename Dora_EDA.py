@@ -376,7 +376,7 @@ class MyModel: # Renamed class for clarity
         correlated_pairs.sort(key=lambda x: abs(x[2]), reverse=True)
         return correlated_pairs
 
-    def get_columns_with_high_missing(self, threshold: float = 0.7):
+    def get_columns_with_high_missing(self, threshold: float = 0.8):
         """
         Returns columns with more than the given fraction of missing (NaN) values.
 
@@ -387,25 +387,17 @@ class MyModel: # Renamed class for clarity
             List[str]: List of column names with high missingness.
         """
         if self.dataframe is None or self.dataframe.is_empty():
-            print("DEBUG: Dataframe is None or empty")
             return []
 
         total_rows = self.dataframe.height
-        print(f"DEBUG: Total rows = {total_rows}")
-
         null_counts = self.dataframe.null_count().to_dict(as_series=False)
-        print("DEBUG: Null counts per column:")
-        for col, count_list in null_counts.items():
-            print(f"  {col}: {count_list[0]} missing")
-
         high_missing_cols = []
         for col, count_list in null_counts.items():
             missing_fraction = count_list[0] / total_rows
-            print(f"DEBUG: {col} → missing fraction = {missing_fraction:.2f}")
             if missing_fraction > threshold:
                 high_missing_cols.append(col)
 
-        print(f"DEBUG: Found {len(high_missing_cols)} columns over threshold {threshold}")
+        print(f"Columns with more than 80% missing values: {high_missing_cols}")
         return high_missing_cols
 
     def summarize_numerical_columns(self):
