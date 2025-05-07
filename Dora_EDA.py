@@ -1,14 +1,14 @@
 # eda_analyzer.py
 
-import polars as pl # Changed import
-import polars.selectors as cs # Import selectors for easier dtype selection
 import matplotlib.pyplot as plt
 import seaborn as sns
-import numpy as np
 from scipy import stats
 import time
 import os
-from typing import Optional, List, Union # Added Union for type hints
+from typing import Optional, List
+import polars as pl
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
 
 # Standard progress bar
 try:
@@ -226,7 +226,6 @@ class MyModel: # Renamed class for clarity
                 print(f"Error plotting distribution for {col}: {e}")
                 plt.close()
 
-
     def _analyze_categorical_features(self, df: pl.DataFrame, cat_cols: List[str], max_plots: Optional[int], threshold: int, plot_dist: bool, save_plots: bool, plot_dir: str):
         """Analyzes and optionally plots distributions for categorical features using Polars."""
         cols_to_analyze = cat_cols
@@ -308,7 +307,6 @@ class MyModel: # Renamed class for clarity
                 # Catch potential errors during Polars operations or plotting
                 print(f"Error analyzing categorical feature {col}: {e}")
                 plt.close()
-
 
     def _save_or_show_plot(self, plt_obj, save, directory, filename):
         """Saves or shows the current plot and closes it."""
@@ -471,3 +469,165 @@ class MyModel: # Renamed class for clarity
             print("No columns have missing values.")
 
         return cols_with_missing
+
+
+class FeatureEngineer:
+    """
+    Automatically imputes:
+    - Mode for binary/small categorical numeric columns with missing values.
+    - Median for continuous numeric columns with missing values.
+    """
+
+    def __init__(self, df: pl.DataFrame):
+        """
+        Args:
+            df (pl.DataFrame): The input dataframe.
+        """
+        self.df = df
+        self.impute_values = {}
+        self.binary_or_categorical_cols = []
+        self.continuous_numeric_cols = []
+
+    def transform(self) -> pl.DataFrame:
+        print("\n=== FeatureEngineering (Auto-Imputation): Start ===")
+
+        cols_with_missing = self._get_columns_with_missing()
+        print(f"Found {len(cols_with_missing)} columns with missing values: {cols_with_missing}")
+
+        for col in cols_with_missing:
+            # Drop nulls to check unique non-null values
+            unique_vals = self.df[col].drop_nulls().unique().to_list()
+            n_unique = len(unique_vals)
+            dtype = self.df.schema[col]
+            is_numeric = dtype in (
+                pl.Int8, pl.Int16, pl.Int32, pl.Int64,
+                pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64,
+                pl.Float32, pl.Float64
+            )
+
+            if is_numeric and n_unique in [2, 3]:
+                # Binary or small categorical numeric (e.g., -1, 0, +1)
+                mode_val = self._get_mode(col)
+                self.df = self.df.with_columns(pl.col(col).fill_null(mode_val))
+                self.impute_values[col] = mode_val
+                self.binary_or_categorical_cols.append(col)
+                print(f"Imputed {col} (binary/categorical numeric) with mode: {mode_val}")
+            elif is_numeric:
+                # Continuous numeric column
+                median_val = self.df[col].median()
+                self.df = self.df.with_columns(pl.col(col).fill_null(median_val))
+                self.impute_values[col] = median_val
+                self.continuous_numeric_cols.append(col)
+                print(f"Imputed {col} (continuous numeric) with median: {median_val}")
+            else:
+                print(f"Skipped {col}: Not numeric (dtype={dtype}).")
+
+        print("\n=== FeatureEngineering: Complete ===")
+        print(f"Binary/categorical numeric columns imputed: {self.binary_or_categorical_cols}")
+        print(f"Continuous numeric columns imputed: {self.continuous_numeric_cols}")
+
+        return self.df
+
+    def _get_columns_with_missing(self) -> List[str]:
+        """
+        Returns a list of columns with at least one missing value.
+        """
+        null_counts = self.df.null_count().to_dict(as_series=False)
+        cols_with_missing = [col for col, count_list in null_counts.items() if count_list[0] > 0]
+        return cols_with_missing
+
+    def _get_mode(self, col: str):
+        """
+        Returns the mode (most common value) of a column.
+        """
+        vc = self.df[col].drop_nulls().value_counts()
+        if vc.is_empty():
+            return None
+
+        # Dynamically get column names
+        colnames = vc.columns
+        value_col = colnames[0]  # e.g., "comp2_inv"
+        count_col = colnames[1]  # usually "count"
+
+        # Get the most frequent value
+        mode_val = vc.sort(count_col, descending=True)[value_col][0]
+        return mode_val
+
+
+class HotelRanker:
+    def __init__(self, df: pl.DataFrame, target_col: str = "booking_bool", exclude_cols: Optional[List[str]] = None):
+        self.df = df
+        self.target_col = target_col
+        self.exclude_cols = exclude_cols if exclude_cols else []
+        self.model = RandomForestClassifier(n_estimators=100, random_state=42)
+
+    def _prepare_data(self):
+        """
+        Splits into X and y, drops non-feature columns (like search_id etc.)
+        """
+        print("Preparing data...")
+
+        all_cols = self.df.columns
+
+        # Define columns to exclude: target + ID cols + user exclusions
+        exclude = set([self.target_col, 'srch_id', 'prop_id', 'date_time'] + self.exclude_cols)
+        feature_cols = [col for col in all_cols if col not in exclude]
+
+        print(f"Using {len(feature_cols)} feature columns: {feature_cols[:5]}... (and more)")
+
+        X = self.df.select(feature_cols).to_pandas()
+        y = self.df[self.target_col].to_pandas()
+
+        return X, y
+
+    def train(self):
+        """
+        Trains the model.
+        """
+        X, y = self._prepare_data()
+        X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
+
+        print("Training model...")
+        self.model.fit(X_train, y_train)
+        score = self.model.score(X_val, y_val)
+        print(f"Validation Accuracy: {score:.4f}")
+
+    def predict(self, df_test: pl.DataFrame) -> pl.DataFrame:
+        """
+        Predicts scores on the test data and returns Polars DataFrame with srch_id, prop_id, score.
+        """
+        print("Predicting scores for ranking...")
+
+        all_cols = df_test.columns
+        exclude = set(['srch_id', 'prop_id'] + self.exclude_cols)
+        feature_cols = [col for col in all_cols if col not in exclude]
+
+        X_test = df_test.select(feature_cols).to_pandas()
+        scores = self.model.predict_proba(X_test)[:, 1]  # Probability of booking = 1
+
+        # Return Polars DataFrame for ranking
+        result = pl.DataFrame({
+            'srch_id': df_test['srch_id'],
+            'prop_id': df_test['prop_id'],
+            'score': scores
+        })
+
+        return result
+
+    def export_ranking(self, predictions: pl.DataFrame, filename: str = "submission.csv"):
+        """
+        Exports the predictions in Kaggle format (SearchId, PropertyId), sorted by score.
+        """
+        print(f"Exporting predictions to {filename}...")
+
+        # Rank properties per search_id by score descending
+        submission = (
+            predictions
+            .sort(['srch_id', 'score'], descending=[False, True])
+            .select(['srch_id', 'prop_id'])
+            .rename({'srch_id': 'SearchId', 'prop_id': 'PropertyId'})
+        )
+
+        # Save to CSV
+        submission.write_csv(filename)
+        print(f"✅ Saved submission file: {filename}")

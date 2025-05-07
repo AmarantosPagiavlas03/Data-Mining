@@ -232,18 +232,15 @@ class EdaPipeline:
         print("=== EDA Pipeline Complete ===")
 
 class FeatureEngineering:
-    """Null‐handling with drop‐threshold and engineered features, logging all changes."""
+    """Null-handling with imputation and engineered features, logging all changes."""
 
-    def __init__(self, cat_threshold: int = 50, null_pct_threshold: float = 70.0):
+    def __init__(self, cat_threshold: int = 50):
         """
         Args:
-            cat_threshold: max unique values for mode‐imputation of categoricals.
-            null_pct_threshold: if a column has > this % nulls, it's dropped instead of imputed.
+            cat_threshold: max unique values for mode-imputation of categoricals.
         """
         self.cat_threshold = cat_threshold
-        self.null_pct_threshold = null_pct_threshold
         self.impute_values: dict[str, float | str] = {}
-        self.drop_cols: List[str] = []
         self.engineered_cols = [
             "price_per_person",
             "price_hist_ratio",
@@ -259,35 +256,24 @@ class FeatureEngineering:
             .melt(variable_name="column", value_name="missing")
             .with_columns((pl.col("missing") / df.height * 100).round(2).alias("pct"))
         )
-        # show the full dataframe
         nulls = nulls.with_columns(pl.col("column").cast(pl.Utf8))
         nulls = nulls.sort("missing", descending=True)
-        
+
         for row in nulls.to_dicts():
-            col, pct = row["column"], row["pct"]
-            if pct > self.null_pct_threshold:
-                self.drop_cols.append(col)
-            else:
-                # numeric median
-                if df.schema[col] in (pl.Int8, pl.Int16, pl.Int32, pl.Int64,
-                                      pl.Float32, pl.Float64):
-                    self.impute_values[col] = df[col].median()
-                # small‐cardinality categorical → mode
-                elif row := df[col].value_counts().to_dicts():
-                    n_unq = df[col].n_unique()
-                    if 1 < n_unq <= self.cat_threshold:
-                        # find top value by counts
-                        value_col, count_col = list(row[0].keys())
-                        mode_val = max(row, key=lambda r: r[count_col])[value_col]
-                        self.impute_values[col] = mode_val
+            col = row["column"]
+            if df.schema[col] in (pl.Int8, pl.Int16, pl.Int32, pl.Int64,
+                                  pl.Float32, pl.Float64):
+                self.impute_values[col] = df[col].median()
+            elif row := df[col].value_counts().to_dicts():
+                n_unq = df[col].n_unique()
+                if 1 < n_unq <= self.cat_threshold:
+                    value_col, count_col = list(row[0].keys())
+                    mode_val = max(row, key=lambda r: r[count_col])[value_col]
+                    self.impute_values[col] = mode_val
 
         # Logging
         print("=== FeatureEngineering.fit ===")
-        print(f"Dropping {len(self.drop_cols)} columns > {self.null_pct_threshold}% null:")
-        for c in self.drop_cols:
-            pct = next(r["pct"] for r in nulls.to_dicts() if r["column"] == c)
-            print(f"  • {c!r}: {pct}% null")
-        print(f"\nImputing {len(self.impute_values)} columns:")
+        print(f"Imputing {len(self.impute_values)} columns:")
         for c, v in self.impute_values.items():
             print(f"  • {c!r} → {v!r}")
         print("============================\n")
@@ -296,35 +282,27 @@ class FeatureEngineering:
     def transform(self, df: pl.DataFrame) -> pl.DataFrame:
         orig_cols = set(df.columns)
 
-        # 1) Drop high‐null columns
-        if self.drop_cols:
-            df = df.drop(self.drop_cols)
-
-        # 2) Add null‐flags for the rest
+        # 1) Add null-flags for columns to be imputed
         null_flags = [pl.col(c).is_null().alias(f"{c}_is_null")
                       for c in self.impute_values]
         df = df.with_columns(null_flags)
 
-        # 3) Impute
+        # 2) Impute
         df = df.fill_null(self.impute_values)
 
-        # 4) Engineered features
+        # 3) Engineered features
         df = df.with_columns([
-            # price per person
             (pl.col("price_usd") /
              (pl.col("srch_adults_count") + pl.col("srch_children_count"))
             ).alias("price_per_person"),
 
-            # ratio to historical log‐price
             (pl.col("price_usd") /
              (pl.col("prop_log_historical_price") + 1)
             ).alias("price_hist_ratio"),
 
-            # interaction: stars × review score
             (pl.col("prop_starrating") * pl.col("prop_review_score")
             ).alias("star_review_interaction"),
 
-            # search weekday (0=Mon…6=Sun)
             pl.col("date_time")
               .str.strptime(pl.Datetime, "%Y-%m-%d %H:%M:%S")
               .dt.weekday()
@@ -334,11 +312,7 @@ class FeatureEngineering:
         # Logging
         new_cols = set(df.columns) - orig_cols
         print("=== FeatureEngineering.transform ===")
-        if self.drop_cols:
-            print(f"Dropped columns ({len(self.drop_cols)}):")
-            for c in self.drop_cols:
-                print(f"  • {c!r}")
-        print(f"Added null‐flag columns ({len(self.impute_values)}):")
+        print(f"Added null-flag columns ({len(self.impute_values)}):")
         for c in self.impute_values:
             print(f"  • {c + '_is_null'!r}")
         print(f"Added engineered features ({len(self.engineered_cols)}):")
@@ -347,8 +321,6 @@ class FeatureEngineering:
         print("============================\n")
 
         return df
-
-
 
 
 # === Modeling Pipeline ===
