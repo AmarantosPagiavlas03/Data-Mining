@@ -529,25 +529,7 @@ class FeatureEngineer:
 
         return self.df
     
-    def add_avg_location_score(self, how="left") -> pl.DataFrame:
-        if not isinstance(self.df, pl.DataFrame):
-            self.df = pl.DataFrame(self.df)
-        agg = (
-            self.df
-            .group_by("prop_id")                             
-            .agg(
-                (pl.col("prop_location_score1") +
-                 pl.col("prop_location_score2"))
-                .mean()
-                .alias("avg_location_score")
-            )
-        )
-        self.df = (
-            self.df
-            .join(agg, on="prop_id", how=how)
-            .drop(["prop_location_score1", "prop_location_score2"])
-        )
-        return self.df
+
 
     def add_same_country_feature(self) -> pl.DataFrame:
         self.df = self.df.with_columns(
