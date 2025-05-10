@@ -528,6 +528,59 @@ class FeatureEngineer:
         print(f"Continuous numeric columns imputed: {self.continuous_numeric_cols}")
 
         return self.df
+    
+    def add_avg_location_score(self, how="left") -> pl.DataFrame:
+        if not isinstance(self.df, pl.DataFrame):
+            self.df = pl.DataFrame(self.df)
+        agg = (
+            self.df
+            .group_by("prop_id")                             
+            .agg(
+                (pl.col("prop_location_score1") +
+                 pl.col("prop_location_score2"))
+                .mean()
+                .alias("avg_location_score")
+            )
+        )
+        self.df = (
+            self.df
+            .join(agg, on="prop_id", how=how)
+            .drop(["prop_location_score1", "prop_location_score2"])
+        )
+        return self.df
+
+    def add_same_country_feature(self) -> pl.DataFrame:
+        self.df = self.df.with_columns(
+            (pl.col("visitor_location_country_id") == pl.col("prop_country_id"))
+            .cast(pl.Int8)
+            .alias("same_country")
+        )
+
+        return self.df
+
+    def add_avg_guest_count(self, how: str = "left") -> pl.DataFrame:
+ 
+        if not isinstance(self.df, pl.DataFrame):
+            self.df = pl.from_pandas(self.df)
+ 
+        agg = (
+            self.df
+            .group_by("srch_id")
+            .agg(
+                (
+                    pl.col("srch_adults_count") +
+                    pl.col("srch_children_count")
+                )
+                .mean()
+                .alias("avg_guest_count")
+            )
+        ) 
+        self.df = (
+            self.df
+            .join(agg, on="srch_id", how=how)
+            .drop(["srch_adults_count", "srch_children_count"])
+        )
+        return self.df
 
     def add_interaction_target(self) -> pl.DataFrame:
         """
