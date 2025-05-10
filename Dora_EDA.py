@@ -476,6 +476,8 @@ class FeatureEngineer:
     Automatically imputes:
     - Mode for binary/small categorical numeric columns with missing values.
     - Median for continuous numeric columns with missing values.
+
+    Target engineering (e.g., adding 'interaction_target') is now a separate method.
     """
 
     def __init__(self, df: pl.DataFrame):
@@ -495,7 +497,6 @@ class FeatureEngineer:
         print(f"Found {len(cols_with_missing)} columns with missing values: {cols_with_missing}")
 
         for col in cols_with_missing:
-            # Drop nulls to check unique non-null values
             unique_vals = self.df[col].drop_nulls().unique().to_list()
             n_unique = len(unique_vals)
             dtype = self.df.schema[col]
@@ -528,34 +529,45 @@ class FeatureEngineer:
 
         return self.df
 
-    def _get_columns_with_missing(self) -> List[str]:
+    def add_interaction_target(self) -> pl.DataFrame:
         """
-        Returns a list of columns with at least one missing value.
+        Adds the 'interaction_target' column if 'booking_bool' and 'click_bool' are present.
         """
+        print("\n=== FeatureEngineering (Target Engineering): Start ===")
+        if 'booking_bool' in self.df.columns and 'click_bool' in self.df.columns:
+            print("✅ Adding interaction_target column (combining booking_bool and click_bool)...")
+            self.df = self.df.with_columns(
+                (
+                        (pl.col("booking_bool") * 2) +
+                        ((pl.col("click_bool") == 1) & (pl.col("booking_bool") == 0)).cast(pl.Int8)
+                ).alias("interaction_target")
+            )
+            print("✅ interaction_target added!")
+        else:
+            print("⚠️ Skipping target engineering: booking_bool or click_bool not found.")
+        return self.df
+
+    def _get_columns_with_missing(self) -> list:
         null_counts = self.df.null_count().to_dict(as_series=False)
         cols_with_missing = [col for col, count_list in null_counts.items() if count_list[0] > 0]
         return cols_with_missing
 
     def _get_mode(self, col: str):
-        """
-        Returns the mode (most common value) of a column.
-        """
         vc = self.df[col].drop_nulls().value_counts()
         if vc.is_empty():
             return None
 
         # Dynamically get column names
         colnames = vc.columns
-        value_col = colnames[0]  # e.g., "comp2_inv"
-        count_col = colnames[1]  # usually "count"
+        value_col = colnames[0]
+        count_col = colnames[1]
 
-        # Get the most frequent value
         mode_val = vc.sort(count_col, descending=True)[value_col][0]
         return mode_val
 
 
 class HotelRanker:
-    def __init__(self, df: pl.DataFrame, target_col: str = "booking_bool", exclude_cols: Optional[List[str]] = None):
+    def __init__(self, df: pl.DataFrame, target_col: str = "interaction_target", exclude_cols: Optional[List[str]] = None):
         self.df = df
         self.target_col = target_col
         self.exclude_cols = exclude_cols if exclude_cols else []
@@ -570,7 +582,7 @@ class HotelRanker:
         all_cols = self.df.columns
 
         # Define columns to exclude: target + ID cols + user exclusions
-        exclude = set([self.target_col, 'srch_id', 'prop_id', 'date_time'] + self.exclude_cols)
+        exclude = set([self.target_col, 'srch_id', 'prop_id'] + self.exclude_cols)
         feature_cols = [col for col in all_cols if col not in exclude]
 
         print(f"Using {len(feature_cols)} feature columns: {feature_cols[:5]}... (and more)")
