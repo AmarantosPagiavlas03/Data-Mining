@@ -1,5 +1,5 @@
 # eda_analyzer.py
-
+import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy import stats
@@ -9,6 +9,10 @@ from typing import Optional, List
 import polars as pl
 from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestClassifier
+from lightgbm import LGBMRanker
+from sklearn.model_selection import GroupShuffleSplit 
+import lightgbm as lgb, json, os
+print(lgb.__version__, lgb.basic._LIB.LGBM_GetLastError())
 
 # Standard progress bar
 try:
@@ -529,13 +533,67 @@ class FeatureEngineer:
 
         return self.df
     
+    # ------------------------------------------------------------
+    # Search-level relative features
+    # ------------------------------------------------------------
+    def add_search_relative_features(self) -> pl.DataFrame:
+        """
+        Adds:
+        - ft_price_rank  :  price rank (0=cheapest) within each srch_id, scaled 0-1
+        - ft_price_rel   :  (price_usd – mean_price) / std_price   (z-score style)
+        - ft_review_norm :  prop_review_score divided by max in search
+        """
+        # safety checks – skip gracefully if a column is missing
+        required = {"srch_id", "price_usd", "prop_review_score"}
+        missing  = required - set(self.df.columns)
+        if missing:
+            print(f"[add_search_relative_features] skipped – missing {missing}")
+            return self.df
+
+        # price rank (0..1, lower is cheaper)
+        self.df = (
+            self.df
+            .with_columns(
+                pl.col("price_usd")
+                  .rank("dense")                         # 1,2,3,…
+                  .over("srch_id")
+                  .alias("tmp_rank")
+            )
+            .with_columns(
+                (pl.col("tmp_rank") - 1)                 # 0-based
+                / (pl.col("tmp_rank").max().over("srch_id") - 1)
+                .fill_nan(0)                             # single-option searches
+                .alias("ft_price_rank")
+            )
+            .drop("tmp_rank")
+        )
+
+        # price z-score within search
+        self.df = self.df.with_columns(
+            (
+                (pl.col("price_usd") - pl.col("price_usd").mean().over("srch_id"))
+                / pl.col("price_usd").std().over("srch_id")
+            ).fill_nan(0).alias("ft_price_rel")
+        )
+
+        # review score normalised 0-1 within search
+        self.df = self.df.with_columns(
+            (
+                pl.col("prop_review_score")
+                / pl.col("prop_review_score").max().over("srch_id")
+            ).fill_nan(0).alias("ft_review_norm")
+        )
+
+        print("✅ search-relative features added: "
+              "ft_price_rank, ft_price_rel, ft_review_norm")
+        return self.df
 
 
     def add_same_country_feature(self) -> pl.DataFrame:
         self.df = self.df.with_columns(
             (pl.col("visitor_location_country_id") == pl.col("prop_country_id"))
             .cast(pl.Int8)
-            .alias("same_country")
+            .alias("ft_same_country")
         )
 
         return self.df
@@ -554,14 +612,9 @@ class FeatureEngineer:
                     pl.col("srch_children_count")
                 )
                 .mean()
-                .alias("avg_guest_count")
+                .alias("ft_avg_guest_count")
             )
         ) 
-        self.df = (
-            self.df
-            .join(agg, on="srch_id", how=how)
-            .drop(["srch_adults_count", "srch_children_count"])
-        )
         return self.df
 
     def add_interaction_target(self) -> pl.DataFrame:
@@ -581,6 +634,274 @@ class FeatureEngineer:
         else:
             print("⚠️ Skipping target engineering: booking_bool or click_bool not found.")
         return self.df
+    
+    # ------------------------------------------------------------
+    # Extra hand-crafted features (price, stars, comps, length-of-stay)
+    # ------------------------------------------------------------
+    def add_extra_features(self) -> pl.DataFrame:
+        """
+        Adds 7 commonly useful features.  All computations are leakage-safe.
+        """
+        df = self.df  # shorthand
+
+        # ---------- log(price) -----------------------------------
+        if "price_usd" in df.columns:
+            df = df.with_columns(
+                pl.col("price_usd").log1p().alias("ft_log_price")
+            )
+
+        # ---------- price per person -----------------------------
+        need_pp = {"price_usd", "srch_adults_count", "srch_children_count"}
+        if need_pp <= set(df.columns):
+            print("Adding ft_price_per_person (price per person)...")
+            denom = (
+                pl.col("srch_adults_count") + pl.col("srch_children_count")
+            ).clip(lower_bound=1)          # guarantees ≥ 1
+
+            df = df.with_columns(
+                (pl.col("price_usd") / denom).alias("ft_price_per_person")
+            )
+ 
+
+        # ---------- star-rating difference ----------------------
+        need_star = {"prop_starrating", "visitor_hist_starrating"}
+        if need_star <= set(df.columns):
+            print("Adding ft_star_diff (star rating difference)...")
+            df = df.with_columns(
+                (
+                    pl.col("prop_starrating") - pl.col("visitor_hist_starrating")
+                ).fill_null(0).alias("ft_star_diff")
+            )
+
+        # ---------- location score normalised within search -----
+        if {"srch_id", "prop_location_score1"} <= set(df.columns):
+            print("Adding ft_loc_score_norm (location score normalised)...")
+            df = df.with_columns(
+                (
+                    pl.col("prop_location_score1")
+                    / pl.col("prop_location_score1").max().over("srch_id")
+                ).fill_nan(0).alias("ft_loc_score_norm")
+            )
+
+        # ---------- competitor cheaper count --------------------
+        comp_rate_cols = [c for c in df.columns if c.startswith("comp") and c.endswith("_rate")]
+        if comp_rate_cols:
+            print("Adding ft_comp_cheaper (competitor cheaper count)...")
+            df = df.with_columns(
+                (
+                    sum((pl.col(c) < 0).cast(pl.Int8) for c in comp_rate_cols)
+                ).alias("ft_comp_cheaper")
+            )
+
+        # ---------- price percentile (0..1) ---------------------
+        if {"srch_id", "price_usd"} <= set(df.columns):
+            print("Adding ft_price_percentile (price percentile)...")
+            df = (
+                df
+                .with_columns(
+                    pl.col("price_usd")
+                      .rank("dense")
+                      .over("srch_id")
+                      .alias("tmp_rank_p")
+                )
+                .with_columns(
+                    (pl.col("tmp_rank_p") - 1)
+                    / (pl.col("tmp_rank_p").max().over("srch_id") - 1)
+                    .fill_nan(0)
+                    .alias("ft_price_percentile")
+                )
+                .drop("tmp_rank_p")
+            )
+
+        self.df = df
+        print("✅ extra features added")
+        return self.df
+
+    # ------------------------------------------------------------
+    # 1.  Temporal features from date_time
+    # ------------------------------------------------------------
+    def add_temporal_features(self) -> pl.DataFrame:
+        """
+        Expects column 'date_time' in canonical Expedia format
+        e.g. '2013-01-02 08:07:28'.
+        Adds:
+        - ft_month           : 1-12
+        - ft_dow             : 0-6  (Mon=0)
+        - ft_is_weekend      : 1 if Sat/Sun, else 0
+        - ft_request_hour    : 0-23
+        """
+
+        if "date_time" not in self.df.columns:
+            print("[add_temporal_features] skipped – 'date_time' missing")
+            return self.df
+
+        dt = pl.col("date_time").str.strptime(pl.Datetime, "%Y-%m-%d %H:%M:%S")
+
+        self.df = self.df.with_columns([
+            dt.dt.month().alias("ft_month"),
+            dt.dt.weekday().alias("ft_dow"),
+            (dt.dt.weekday().is_in([5, 6])).cast(pl.Int8).alias("ft_is_weekend"),
+            dt.dt.hour().alias("ft_request_hour"),
+        ])
+
+        print("✅ temporal features added: "
+            "ft_month, ft_dow, ft_is_weekend, ft_request_hour")
+        return self.df
+
+
+    # ------------------------------------------------------------
+    # 2.  Price vs historical baselines
+    # ------------------------------------------------------------
+    def add_price_history_features(self) -> pl.DataFrame:
+        """
+        Needs:
+        - price_usd
+        - visitor_hist_adr_usd      (user's avg daily rate)  – may be null
+        - prop_log_historical_price (property's avg price)
+        Adds:
+        - ft_price_vs_user_hist     : price - user_hist
+        - ft_price_vs_prop_hist     : price - prop_hist
+        - ft_price_pct_over_hist    : (price / prop_hist) - 1
+        """
+
+        required_cols = {"price_usd",
+                        "visitor_hist_adr_usd",
+                        "prop_log_historical_price"}
+        missing = required_cols - set(self.df.columns)
+        if missing:
+            print(f"[add_price_history_features] skipped – missing {missing}")
+            return self.df
+
+        self.df = self.df.with_columns([
+            (pl.col("price_usd") - pl.col("visitor_hist_adr_usd"))
+                .fill_null(0).alias("ft_price_vs_user_hist"),
+
+            (pl.col("price_usd") - pl.col("prop_log_historical_price"))
+                .alias("ft_price_vs_prop_hist"),
+
+            ((pl.col("price_usd") / pl.col("prop_log_historical_price")) - 1)
+                .alias("ft_price_pct_over_hist"),
+        ])
+
+        print("✅ price-history features added: "
+            "ft_price_vs_user_hist, ft_price_vs_prop_hist, "
+            "ft_price_pct_over_hist")
+        return self.df
+
+ 
+    def evaluate_before_and_after(
+        self,
+        before_cols: List[str],
+        after_cols:  List[str],
+        *,
+        mode: str            = "fast",   # "fast"  or "full"
+        sample_frac: float   = 0.30,     # only used in fast-mode
+        target_col: str      = "interaction_target",
+        group_col:  str      = "srch_id",
+        random_state: int    = 42,
+    ) -> dict:
+        """
+        Quickly decide whether a new feature set helps.
+
+        mode="fast"  ➜  CPU LightGBM ranker, 64 trees, optional row-sample
+        mode="full"  ➜  Your 1 500-tree GPU LambdaMART (default)
+
+        Returns
+        -------
+        {"before": {"ndcg@5": float}, "after": {"ndcg@5": float}}
+        """
+
+        # ---- cheap validations ---------------------------------------
+        for name, cols in (("before", before_cols), ("after", after_cols)):
+            missing = [c for c in cols if c not in self.df.columns]
+            if missing:
+                raise ValueError(f"{name} columns missing: {missing}")
+        for col in (target_col, group_col):
+            if col not in self.df.columns:
+                raise ValueError(f"Column '{col}' not found in dataframe")
+
+        # ---- optional row sampling for very fast turnaround ----------
+        df_eval = (
+            self.df.sample(fraction=sample_frac, seed=random_state)
+            if mode == "fast" and 0 < sample_frac < 1.0
+            else self.df
+        )
+
+        y       = df_eval[target_col].to_pandas()
+        groups  = df_eval[group_col].to_pandas()
+
+        # keep the split identical for before/after
+        from sklearn.model_selection import GroupShuffleSplit
+        gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=random_state)
+        tr_idx, va_idx = next(gss.split(X=np.zeros(len(y)), y=y, groups=groups))
+
+        def _to_group_sizes(sr):
+            return sr.value_counts(sort=False).sort_index().values
+
+        # ---- parameter presets ---------------------------------------
+        if mode == "fast":
+            lgb_params = dict(
+                objective      = "lambdarank",
+                metric         = "ndcg",
+                eval_at        = [5],
+                n_estimators   = 64,
+                learning_rate  = 0.2,
+                num_leaves     = 31,
+                max_depth      = 4,
+                subsample      = 0.8,
+                colsample_bytree = 0.8,
+                device_type    = "gpu",      # feather-weight
+                max_bin        = 63,
+                random_state   = random_state,
+                n_jobs         = -1,
+            )
+        else:  # full GPU block (same as your HotelRanker defaults)
+            lgb_params = dict(
+                objective      = "lambdarank",
+                metric         = "ndcg",
+                eval_at        = [5],
+                n_estimators   = 1500,
+                learning_rate  = 0.03,
+                num_leaves     = 255,
+                subsample      = 0.8,
+                colsample_bytree = 0.8,
+                device_type    = "gpu",
+                max_bin        = 63,
+                random_state   = random_state,
+                n_jobs         = -1,
+            )
+
+        from lightgbm import LGBMRanker, log_evaluation
+
+        def _score(feature_cols, tag):
+            X = df_eval.select(feature_cols).to_pandas()
+            X_tr, X_va = X.iloc[tr_idx], X.iloc[va_idx]
+            y_tr, y_va = y.iloc[tr_idx], y.iloc[va_idx]
+
+            g_tr = _to_group_sizes(groups.iloc[tr_idx])
+            g_va = _to_group_sizes(groups.iloc[va_idx])
+
+            model = LGBMRanker(**lgb_params)
+            model.fit(
+                X_tr, y_tr,
+                group=g_tr,
+                eval_set=[(X_va, y_va)],
+                eval_group=[g_va],
+                callbacks=[log_evaluation(0)],        # silence output
+            )
+            ndcg5 = model.best_score_["valid_0"]["ndcg@5"]
+            print(f"{tag:<7s} | NDCG@5 = {ndcg5:.4f}  ({mode}-mode)")
+            return ndcg5
+
+        ndcg_before = _score(before_cols, "before")
+        ndcg_after  = _score(after_cols,  "after")
+
+        diff = ndcg_after - ndcg_before
+        print(f"\nΔNDCG@5 = {diff:+.4f}  →  {'IMPROVED' if diff>0 else 'WORSE'}")
+
+        return {"before": {"ndcg@5": ndcg_before},
+                "after":  {"ndcg@5": ndcg_after},
+                "delta":  diff}
 
     def _get_columns_with_missing(self) -> list:
         null_counts = self.df.null_count().to_dict(as_series=False)
@@ -602,64 +923,103 @@ class FeatureEngineer:
 
 
 class HotelRanker:
-    def __init__(self, df: pl.DataFrame, target_col: str = "interaction_target", exclude_cols: Optional[List[str]] = None):
+    def __init__(
+        self,
+        df: pl.DataFrame,
+        target_col: str = "interaction_target",
+        exclude_cols: Optional[List[str]] = None,
+        lgbm_params: Optional[dict] = None,        # <- new
+    ):
         self.df = df
         self.target_col = target_col
-        self.exclude_cols = exclude_cols if exclude_cols else []
-        self.model = RandomForestClassifier(n_estimators=100, random_state=42)
+        self.exclude_cols = exclude_cols or []
 
-    def _prepare_data(self):
-        """
-        Splits into X and y, drops non-feature columns (like search_id etc.)
-        """
-        print("Preparing data...")
+        # --- LightGBM ranker --------------------------------------------------
+        default_params = dict(
+            objective      = "lambdarank",
+            metric         = "ndcg",
+            eval_at        = [1, 3, 5],
+            n_estimators   = 2000,        # more trees, smaller lr on GPU
+            learning_rate  = 0.03,
+            num_leaves     = 255,         # power of two works well with GPU
+            max_depth      = -1,
+            subsample      = 0.8,
+            colsample_bytree = 0.8,
+            # ---------- GPU switches ----------
+            device_type    = "gpu",       # <-- activates GPU learner
+            gpu_platform_id= 0,           # change if multiple OpenCL platforms
+            gpu_device_id  = 0,           # pick your GPU
+            # Smaller histograms speed up GPU even more
+            max_bin        = 63,          # 2⁶-1; try 127 if accuracy drops
+            random_state   = 42,
+            n_jobs         = -1,
+)
+        if lgbm_params:
+            default_params.update(lgbm_params)
 
+        self.model = LGBMRanker(**default_params)  # <-- replaces RandomForest
+
+    def _prepare_data(self, return_groups: bool = False):
         all_cols = self.df.columns
-
-        # Define columns to exclude: target + ID cols + user exclusions
-        exclude = set([self.target_col, 'srch_id', 'prop_id'] + self.exclude_cols)
-        feature_cols = [col for col in all_cols if col not in exclude]
-
-        print(f"Using {len(feature_cols)} feature columns: {feature_cols[:5]}... (and more)")
+        exclude = set([self.target_col, "srch_id", "prop_id"] + self.exclude_cols)
+        feature_cols = [c for c in all_cols if c not in exclude]
 
         X = self.df.select(feature_cols).to_pandas()
         y = self.df[self.target_col].to_pandas()
 
+        if return_groups:
+            groups = self.df["srch_id"].to_pandas()    # 1-row-per-hotel
+            return X, y, groups
         return X, y
 
     def train(self):
-        """
-        Trains the model.
-        """
-        X, y = self._prepare_data()
-        X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
+        # Keep whole searches together in the split
+        X, y, groups = self._prepare_data(return_groups=True)
 
-        print("Training model...")
-        self.model.fit(X_train, y_train)
-        score = self.model.score(X_val, y_val)
-        print(f"Validation Accuracy: {score:.4f}")
+        gss = GroupShuffleSplit(test_size=0.2, n_splits=1, random_state=42)
+        train_idx, val_idx = next(gss.split(X, y, groups))
+
+        X_train, y_train = X.iloc[train_idx], y.iloc[train_idx]
+        X_val,   y_val   = X.iloc[val_idx],   y.iloc[val_idx]
+
+        grp_train = groups.iloc[train_idx]
+        grp_val   = groups.iloc[val_idx]
+
+        # LightGBM wants "number of rows in each group"  ➜  np.array([...])
+        def _to_group_sizes(series):
+            return series.value_counts(sort=False).sort_index().values
+
+        group_train_sizes = _to_group_sizes(grp_train)
+        group_val_sizes   = _to_group_sizes(grp_val)
+
+        print("Training LightGBM LambdaMART ranker …")
+        self.model.fit(
+            X_train,
+            y_train,
+            group=group_train_sizes,
+            eval_set=[(X_val, y_val)],
+            eval_group=[group_val_sizes],
+        )
+        best_ndcg5 = self.model.best_score_["valid_0"]["ndcg@5"]
+        print(f"Best NDCG@5 on validation: {best_ndcg5:.4f}")
+
 
     def predict(self, df_test: pl.DataFrame) -> pl.DataFrame:
-        """
-        Predicts scores on the test data and returns Polars DataFrame with srch_id, prop_id, score.
-        """
-        print("Predicting scores for ranking...")
-
         all_cols = df_test.columns
-        exclude = set(['srch_id', 'prop_id'] + self.exclude_cols)
-        feature_cols = [col for col in all_cols if col not in exclude]
+        exclude  = set(["srch_id", "prop_id"] + self.exclude_cols)
+        feature_cols = [c for c in all_cols if c not in exclude]
 
         X_test = df_test.select(feature_cols).to_pandas()
-        scores = self.model.predict_proba(X_test)[:, 1]  # Probability of booking = 1
+        scores = self.model.predict(X_test)        # 1-D relevance scores
 
-        # Return Polars DataFrame for ranking
-        result = pl.DataFrame({
-            'srch_id': df_test['srch_id'],
-            'prop_id': df_test['prop_id'],
-            'score': scores
-        })
+        return pl.DataFrame(
+            {
+                "srch_id": df_test["srch_id"],
+                "prop_id": df_test["prop_id"],
+                "score":   scores,
+            }
+        )
 
-        return result
 
     def export_ranking(self, predictions: pl.DataFrame, filename: str = "submission.csv"):
         """
