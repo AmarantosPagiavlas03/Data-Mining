@@ -625,10 +625,12 @@ class FeatureEngineer:
         if 'booking_bool' in self.df.columns and 'click_bool' in self.df.columns:
             print("✅ Adding interaction_target column (combining booking_bool and click_bool)...")
             self.df = self.df.with_columns(
-                (
-                        (pl.col("booking_bool") * 2) +
-                        ((pl.col("click_bool") == 1) & (pl.col("booking_bool") == 0)).cast(pl.Int8)
-                ).alias("interaction_target")
+                pl.when(pl.col("booking_book")==1)
+                .then(5)
+                .when(pl.col("click_bool")==1)
+                .then(1)
+                .otherwise(0)
+                .alias("interaction_target")
             )
             print("✅ interaction_target added!")
         else:
